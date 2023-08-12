@@ -6,7 +6,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from utils.kld_loss import compute_kld_loss, KLDloss
+
 
 def smooth_BCE(eps=0.1):  # https://github.com/ultralytics/yolov3/issues/238#issuecomment-598028441
     # return positive, negative label smoothing BCE targets
@@ -35,9 +35,8 @@ class YOLOLoss(nn.Module):
 
         self.cp, self.cn                    = smooth_BCE(eps=label_smoothing)  
         self.BCEcls, self.BCEobj, self.gr   = nn.BCEWithLogitsLoss(), nn.BCEWithLogitsLoss(), 1
-        self.kldbbox = KLDloss(taf=1.0, fun='sqrt')
 
-    def bbox_iou(self, box1, box2, x1y1x2y2=True, GIoU=False, DIoU=False, CIoU=False, eps=1e-7):
+    def bbox_iou(box1, box2, x1y1x2y2 = True, GIoU = False, DIoU = False, CIoU = False, MDPIoU = False, eps = 1e-7):
         box2 = box2.T
 
         if x1y1x2y2:
@@ -49,24 +48,27 @@ class YOLOLoss(nn.Module):
             b2_x1, b2_x2 = box2[0] - box2[2] / 2, box2[0] + box2[2] / 2
             b2_y1, b2_y2 = box2[1] - box2[3] / 2, box2[1] + box2[3] / 2
 
-        inter = (torch.min(b1_x2, b2_x2) - torch.max(b1_x1, b2_x1)).clamp(0) * \
-                (torch.min(b1_y2, b2_y2) - torch.max(b1_y1, b2_y1)).clamp(0)
-
-        w1, h1  = b1_x2 - b1_x1, b1_y2 - b1_y1 + eps
-        w2, h2  = b2_x2 - b2_x1, b2_y2 - b2_y1 + eps
-        union   = w1 * h1 + w2 * h2 - inter + eps
+        inter = (torch.min(b1_x2, b2_x2) - torch.max(b1_x1, b2_x1)).clamp(0) * (
+                    torch.min(b1_y2, b2_y2) - torch.max(b1_y1, b2_y1)).clamp(0)
+        w1, h1 = b1_x2 - b1_x1, b1_y2 - b1_y1 + eps
+        w2, h2 = b2_x2 - b2_x1, b2_y2 - b2_y1 + eps
+        union = w1 * h1 + w2 * h2 - inter + eps
 
         iou = inter / union
 
-        if GIoU or DIoU or CIoU:
-            cw = torch.max(b1_x2, b2_x2) - torch.min(b1_x1, b2_x1)  # convex (smallest enclosing box) width
-            ch = torch.max(b1_y2, b2_y2) - torch.min(b1_y1, b2_y1)  # convex height
-            if CIoU or DIoU:  # Distance or Complete IoU https://arxiv.org/abs/1911.08287v1
-                c2 = cw ** 2 + ch ** 2 + eps  # convex diagonal squared
+        if GIoU or DIoU or CIoU or MDPIoU:
+            cw = torch.max(b1_x2, b2_x2) - torch.min(b1_x1, b2_x1)  # 外接大矩形框的宽
+            ch = torch.max(b1_y2, b2_y2) - torch.min(b1_y1, b2_y1)  # 外接大矩形框的高
+            if CIoU or DIoU or MDPIoU:  # Distance or Complete IoU https://arxiv.org/abs/1911.08287v1
+                c2 = cw ** 2 + ch ** 2 + eps  # convex diagonal squared  # 外接大矩形框的对角线
+                d1_2 = (b2_x1 - b1_x1) ** 2 + (b2_y1 - b1_y1) ** 2
+                d2_2 = (b2_x2 - b1_x2) ** 2 + (b2_y2 - b1_y2) ** 2
                 rho2 = ((b2_x1 + b2_x2 - b1_x1 - b1_x2) ** 2 +
-                        (b2_y1 + b2_y2 - b1_y1 - b1_y2) ** 2) / 4  # center distance squared
+                        (b2_y1 + b2_y2 - b1_y1 - b1_y2) ** 2) / 4  # center distance squared 两个box中心点距离的平方
                 if DIoU:
                     return iou - rho2 / c2  # DIoU
+                elif MDPIoU:
+                    return iou - d1_2 / c2 - d2_2 / c2  # MDPIoU 无代码 自己现编
                 elif CIoU:  # https://github.com/Zzh-tju/DIoU-SSD-pytorch/blob/master/utils/box/box_utils.py#L47
                     v = (4 / math.pi ** 2) * torch.pow(torch.atan(w2 / h2) - torch.atan(w1 / h1), 2)
                     with torch.no_grad():
@@ -124,7 +126,7 @@ class YOLOLoss(nn.Module):
             n = b.shape[0]
             if n:
                 prediction_pos = prediction[b, a, gj, gi]  # prediction subset corresponding to targets
-                # prediction_pos [xywh angle conf cls ]
+
                 #-------------------------------------------#
                 #   计算匹配上的正样本的回归损失
                 #-------------------------------------------#
@@ -137,38 +139,36 @@ class YOLOLoss(nn.Module):
                 #-------------------------------------------#
                 xy      = prediction_pos[:, :2].sigmoid() * 2. - 0.5
                 wh      = (prediction_pos[:, 2:4].sigmoid() * 2) ** 2 * anchors[i]
-                angle   = (prediction_pos[:, 4:5].sigmoid() - 0.5) * math.pi
-                box_theta = torch.cat((xy, wh, angle), 1)
+                box     = torch.cat((xy, wh), 1)
                 #-------------------------------------------#
                 #   对真实框进行处理，映射到特征层上
                 #-------------------------------------------#
                 selected_tbox           = targets[i][:, 2:6] * feature_map_sizes[i]
                 selected_tbox[:, :2]    -= grid.type_as(prediction)
-                theta                   = targets[i][:, 6:7]
-                selected_tbox_theta     = torch.cat((selected_tbox, theta),1)
                 #-------------------------------------------#
                 #   计算预测框和真实框的回归损失
                 #-------------------------------------------#
-                kldloss                 = self.kldbbox(box_theta, selected_tbox_theta)
-                box_loss                += kldloss.mean()
+                iou                     = self.bbox_iou(box.T, selected_tbox, x1y1x2y2=False, CIoU=True) # 使用CIoU作为回归loss
+                iou                     = self.bbox_iou(box.T, selected_tbox, x1y1x2y2=False, MDPIoU=True) # 使用MDPIoU作为回归loss
+                box_loss                += (1.0 - iou).mean()
                 #-------------------------------------------#
                 #   根据预测结果的iou获得置信度损失的gt
                 #-------------------------------------------#
-                tobj[b, a, gj, gi] = (1.0 - self.gr) + self.gr * (1 - kldloss).detach().clamp(0).type(tobj.dtype)  # iou ratio
+                tobj[b, a, gj, gi] = (1.0 - self.gr) + self.gr * iou.detach().clamp(0).type(tobj.dtype)  # iou ratio
 
                 #-------------------------------------------#
                 #   计算匹配上的正样本的分类损失
                 #-------------------------------------------#
                 selected_tcls               = targets[i][:, 1].long()
-                t                           = torch.full_like(prediction_pos[:, 6:], self.cn, device=device)  # targets
+                t                           = torch.full_like(prediction_pos[:, 5:], self.cn, device=device)  # targets
                 t[range(n), selected_tcls]  = self.cp
-                cls_loss                    += self.BCEcls(prediction_pos[:, 6:], t)  # BCE
+                cls_loss                    += self.BCEcls(prediction_pos[:, 5:], t)  # BCE
 
             #-------------------------------------------#
             #   计算目标是否存在的置信度损失
             #   并且乘上每个特征层的比例
             #-------------------------------------------#
-            obj_loss += self.BCEobj(prediction[..., 5], tobj) * self.balance[i]  # obj loss
+            obj_loss += self.BCEobj(prediction[..., 4], tobj) * self.balance[i]  # obj loss
             
         #-------------------------------------------#
         #   将各个部分的损失乘上比例
@@ -241,7 +241,6 @@ class YOLOLoss(nn.Module):
             #-------------------------------------------#
             b_idx       = targets[:, 0]==batch_idx
             this_target = targets[b_idx]
-            #  targets (tensor): (n_gt_all_batch, [img_index clsid cx cy l s theta ])
             #-------------------------------------------#
             #   如果没有真实框属于该图片则continue
             #-------------------------------------------#
@@ -255,7 +254,7 @@ class YOLOLoss(nn.Module):
             #-------------------------------------------#
             #   从中心宽高到左上角右下角
             #-------------------------------------------#
-            txyxy = torch.cat((txywh, this_target[:,6:]), dim=-1)
+            txyxy = self.xywh2xyxy(txywh)
 
             pxyxys      = []
             p_cls       = []
@@ -290,8 +289,8 @@ class YOLOLoss(nn.Module):
                 #   取出这个真实框对应的预测结果
                 #-------------------------------------------#
                 fg_pred = prediction[b, a, gj, gi]                
-                p_obj.append(fg_pred[:, 5:6]) # [4:5] = theta
-                p_cls.append(fg_pred[:, 6:])
+                p_obj.append(fg_pred[:, 4:5])
+                p_cls.append(fg_pred[:, 5:])
                 
                 #-------------------------------------------#
                 #   获得网格后，进行解码
@@ -299,9 +298,9 @@ class YOLOLoss(nn.Module):
                 grid    = torch.stack([gi, gj], dim=1).type_as(fg_pred)
                 pxy     = (fg_pred[:, :2].sigmoid() * 2. - 0.5 + grid) * self.stride[i]
                 pwh     = (fg_pred[:, 2:4].sigmoid() * 2) ** 2 * anch[i][idx] * self.stride[i]
-                pangle  = (fg_pred[:, 4:5].sigmoid() - 0.5) * math.pi
-                pxywh   = torch.cat([pxy, pwh, pangle], dim=-1)
-                pxyxys.append(pxywh)
+                pxywh   = torch.cat([pxy, pwh], dim=-1)
+                pxyxy   = self.xywh2xyxy(pxywh)
+                pxyxys.append(pxyxy)
             
             #-------------------------------------------#
             #   判断是否存在对应的预测框，不存在则跳过
@@ -328,8 +327,8 @@ class YOLOLoss(nn.Module):
             #   重合程度越大，取-log后越小
             #   因此，真实框与预测框重合度越大，pair_wise_iou_loss越小
             #-------------------------------------------------------------#
-            pair_wise_iou_loss = compute_kld_loss(txyxy, pxyxys, taf=1.0, fun='sqrt')
-            pair_wise_iou      = 1 - pair_wise_iou_loss
+            pair_wise_iou       = self.box_iou(txyxy, pxyxys)
+            pair_wise_iou_loss  = -torch.log(pair_wise_iou + 1e-8)
 
             #-------------------------------------------#
             #   最多二十个预测框与真实框的重合程度
@@ -389,7 +388,7 @@ class YOLOLoss(nn.Module):
             #-------------------------------------------#
             #   取出符合条件的框
             #-------------------------------------------#
-            from_which_layer    = from_which_layer.to(fg_mask_inboxes.device)[fg_mask_inboxes]
+            from_which_layer    = from_which_layer[fg_mask_inboxes]
             all_b               = all_b[fg_mask_inboxes]
             all_a               = all_a[fg_mask_inboxes]
             all_gj              = all_gj[fg_mask_inboxes]
@@ -432,14 +431,14 @@ class YOLOLoss(nn.Module):
         #   序号2:6为特征层的高宽
         #   序号6为1
         #------------------------------------#
-        gain    = torch.ones(8, device=targets.device)
+        gain    = torch.ones(7, device=targets.device)
         #------------------------------------#
         #   ai      [num_anchor, num_gt]
-        #   targets [num_gt, 6] => [num_anchor, num_gt, 8]
+        #   targets [num_gt, 6] => [num_anchor, num_gt, 7]
         #------------------------------------#
         ai      = torch.arange(num_anchor, device=targets.device).float().view(num_anchor, 1).repeat(1, num_gt)
         targets = torch.cat((targets.repeat(num_anchor, 1, 1), ai[:, :, None]), 2)  # append anchor indices
-        # targets (tensor): (na, n_gt_all_batch, [img_index, clsid, cx, cy, l, s, theta, anchor_index]])
+
         g   = 0.5 # offsets
         off = torch.tensor([
             [0, 0],
@@ -514,7 +513,7 @@ class YOLOLoss(nn.Module):
             #   gj、gi不能超出特征层范围
             #   a代表属于该特征点的第几个先验框
             #-------------------------------------------#
-            a = t[:, -1].long()  # anchor indices
+            a = t[:, 6].long()  # anchor indices
             indices.append((b, a, gj.clamp_(0, shape[2] - 1), gi.clamp_(0, shape[3] - 1)))  # image, anchor, grid indices
             anchors.append(anchors_i[a])  # anchors
 
